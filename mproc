@@ -1,0 +1,176 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use File::Path qw(make_path);
+use File::Basename;
+
+use Data::Dumper;
+use Carp;
+
+my $action = shift || error();
+help() if ($action eq "help");
+
+@ARGV or error();
+
+my $name;
+if ($ARGV[0] =~ /^--name=(.+)$/) {
+    $name = $1;
+    shift;
+} else {
+    $name = $ARGV[0] or error();
+    $name = basename($name);
+}
+
+my ($wait, $suspend) = (1, 0);
+$SIG{USR1} = sub {
+    $suspend = !$suspend;
+};
+
+$SIG{USR2} = sub {
+    print "USR2\n";
+    $suspend = $wait = 0;
+};
+
+my $DIR = "/var/run/mproc";
+make_path($DIR);
+
+if ($action eq "start") {
+    start($name, @ARGV);
+} elsif ($action eq "stop") {
+    stop($name, @ARGV);
+} elsif ($action eq "status") {
+    exit(status($name, @ARGV) ? 0 : -1);
+} else {
+    error();
+}
+
+sub start
+{
+    my $name = shift;
+    
+    my $cnt = 0;
+    while ($wait) {
+        my $begin = time();
+        
+        my $pid = fork();
+        if ($pid == 0) {
+            exec(join(" ", @_));
+        }
+        write_pid($name, $pid);
+        
+        wait();
+        last if ($? == 0);
+
+        # protect os
+        $cnt++;
+        if (time() - $begin > 1) {
+            $cnt = 0;
+        } elsif ($cnt > 5) {
+            confess @_, " restart too frequent";
+        }
+
+        while ($suspend) {
+            sleep(1);
+        }
+    }
+    
+    print @_, " exit normal\n";
+}
+
+sub stop
+{
+    my $name = shift;
+    my ($m, $proc) = read_pid($name);
+
+    if (@_) {
+        kill('USR1', $m);
+        system(join(" ", @_));
+        if ($? == 0) {
+            remove_pid($name);
+            kill('USR2', $m);
+        } else {
+            kill('USR1', $m);
+            confess join(" ", @_), " failed";
+        }
+    } else {
+        kill('USR2', $m);
+        kill('TERM', $proc);
+        remove_pid($name);
+    }
+}
+
+sub status
+{
+    my $name = shift;
+    my ($m, $proc) = read_pid($name);
+    if ($m && $proc && -d "/proc/$m" && -d "/proc/$proc") {
+        print "$name is running\n";
+        return 1;
+    } else {
+        print "$name is not running\n";
+        return 0;
+    }
+}
+    
+sub write_pid
+{
+    my ($name, $pid) = @_;
+    
+    writefile("$DIR/$name.m", $$);
+    writefile("$DIR/$name.proc", $pid);
+}
+
+sub read_pid
+{
+    my ($name) = @_;
+    if (-f "$DIR/$name.m" && -f "$DIR/$name.proc") {
+        return (readfile("$DIR/$name.m"),
+                readfile("$DIR/$name.proc"));
+    }
+    return (0, 0);
+}
+
+sub remove_pid
+{
+    my ($name) = @_;
+    unlink("$DIR/$name.m");
+    unlink("$DIR/$name.proc");
+}
+
+sub writefile
+{
+    my ($f, $c) = @_;
+        
+    open(my $fh, ">", $f);
+    print $fh $c;
+    close($fh);
+}
+
+sub readfile
+{
+    my ($f) = @_;
+
+    open(my $fh, "<", $f);
+    my $c = <$fh>;
+    close($fh);
+
+    return $c;
+}
+
+sub error { help(-1); }
+
+sub help
+{
+    my $err = shift || 0;
+    
+    print "mproc help\n";
+    print "mproc start [ --name=_name_ ] command [ arg ... ]\n";
+    print "mproc stop [ --name=_name_ ] [ command [ arg ... ] ]\n";
+    print "mproc status [ --name=_name_ ] [ command [ arg ... ] ]\n";
+    print "\n";
+    print "WARN: if --name not provided, use basename of command as name\n";
+    
+    exit($err);
+}
